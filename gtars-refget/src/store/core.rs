@@ -349,6 +349,13 @@ impl RefgetStore {
         self.inner.set_quiet(quiet);
     }
 
+    /// Set whether substring reads of uncached remote sequences fetch and
+    /// cache the whole `.seq` file (see
+    /// [`ReadonlyRefgetStore::set_cache_whole_sequences`]).
+    pub fn set_cache_whole_sequences(&mut self, cache_whole_sequences: bool) {
+        self.inner.set_cache_whole_sequences(cache_whole_sequences);
+    }
+
     /// Change the storage mode.
     ///
     /// Switching to Encoded fails, leaving the store unchanged, if a sequence

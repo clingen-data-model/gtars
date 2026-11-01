@@ -46,7 +46,7 @@ use super::readonly::{PendingChanges, ReadonlyRefgetStore};
 use super::alias::AliasKind;
 use super::atomic::{atomic_write, atomic_write_bytes};
 use super::fhr_metadata;
-use super::lock::StoreLock;
+use super::lock::{LockOptions, StoreLock};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
@@ -865,6 +865,13 @@ impl ReadonlyRefgetStore {
 
         create_dir_all(cache_path)
             .with_context(|| format!("Failed to create remote cache {}", cache_path.display()))?;
+
+        // Processes sharing a cache directory open it one at a time. Opening
+        // deletes cached files the refreshed manifest no longer vouches for
+        // (all of them on a cold cache), which must not happen while another
+        // process is fetching or loading those files. Held until this returns;
+        // the next opener then finds the cache current and deletes nothing.
+        let _open_lock = StoreLock::acquire(cache_path, "open_remote", LockOptions::default())?;
 
         let origin_path = cache_path.join(".origin");
         match fs::read_to_string(&origin_path) {

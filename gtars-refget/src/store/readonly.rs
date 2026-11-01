@@ -2,6 +2,7 @@
 
 use super::*;
 use super::alias::AliasManager;
+use super::atomic::atomic_write_bytes;
 use super::lock::{LockOptions, StoreLock};
 
 use std::collections::{HashMap, HashSet};
@@ -321,6 +322,9 @@ pub struct ReadonlyRefgetStore {
     pub(crate) seqdata_path_template: Option<String>,
     /// Whether to persist sequences to disk (write-through caching)
     pub(crate) persist_to_disk: bool,
+    /// Whether a substring read of a remote sequence not yet cached fetches
+    /// and caches its whole `.seq` file, rather than just the covering bytes.
+    pub(crate) cache_whole_sequences: bool,
     /// Whether to suppress progress output
     pub(crate) quiet: bool,
     /// Whether to compute ancillary digests (nlp, snlp, sorted_sequences).
@@ -554,6 +558,7 @@ impl ReadonlyRefgetStore {
             remote_source: None,
             seqdata_path_template: None,
             persist_to_disk: false,
+            cache_whole_sequences: false,
             quiet: false,
             ancillary_digests: true,
             attribute_index: false,
@@ -652,6 +657,25 @@ impl ReadonlyRefgetStore {
     /// Returns whether the store is in quiet mode.
     pub fn is_quiet(&self) -> bool {
         self.quiet
+    }
+
+    /// Set whether a substring read of a remote sequence that is not cached
+    /// yet fetches its whole `.seq` file into the cache directory, then reads
+    /// from that file, instead of requesting only the covering bytes.
+    ///
+    /// Byte ranges suit a few scattered reads. A caller that reads many ranges
+    /// of each sequence it touches does better downloading each once; with
+    /// this set, reads never hold the sequence in memory, and processes
+    /// sharing the cache directory download each sequence once between them,
+    /// except when two miss it at the same moment. Default: false. Has no
+    /// effect on a store without both a remote source and a cache directory.
+    pub fn set_cache_whole_sequences(&mut self, cache_whole_sequences: bool) {
+        self.cache_whole_sequences = cache_whole_sequences;
+    }
+
+    /// Returns whether substring reads cache whole remote sequence files.
+    pub fn caches_whole_sequences(&self) -> bool {
+        self.cache_whole_sequences
     }
 
     /// Check whether a valid RefgetStore exists at the given path.
@@ -2382,6 +2406,13 @@ impl ReadonlyRefgetStore {
                     }
                 }
                 if self.remote_source.is_some() {
+                    if self.cache_whole_sequences
+                        && self.local_path.is_some()
+                        && self.seqdata_path_template.is_some()
+                    {
+                        self.cache_sequence_file(meta)?;
+                        return self.get_substring_from_disk(meta, start, end);
+                    }
                     return self.get_substring_from_remote(meta, start, end);
                 }
                 return Err(anyhow!("Sequence data not loaded (stub only)"));
@@ -2596,11 +2627,12 @@ StorageMode::Raw => Ok(sequence[start..end].to_vec()),
                 // for large batches. Past REMOTE_BULK_FETCH_THRESHOLD, download and
                 // cache the whole `.seq` once (needs a local cache dir + path
                 // template to write into), then read every range from the local
-                // file. Single / small-batch reads fall through to pure byte-range.
+                // file. Single / small-batch reads fall through to pure byte-range,
+                // unless the store caches whole sequences on every miss.
                 if !local_seq_exists
                     && self.local_path.is_some()
                     && self.seqdata_path_template.is_some()
-                    && ranges.len() >= REMOTE_BULK_FETCH_THRESHOLD
+                    && (self.cache_whole_sequences || ranges.len() >= REMOTE_BULK_FETCH_THRESHOLD)
                 {
                     let relpath = self.resolve_seq_file_relpath(&meta.sha512t24u)?;
                     let relpath_str = relpath
@@ -2846,6 +2878,17 @@ StorageMode::Raw => Ok(sequence[start..end].to_vec()),
     // =========================================================================
     // Streaming retrieval
     // =========================================================================
+
+    /// Fetch a remote sequence's whole `.seq` file into the cache directory,
+    /// unless it is already there.
+    fn cache_sequence_file(&self, meta: &SequenceMetadata) -> Result<()> {
+        let relpath = self.resolve_seq_file_relpath(&meta.sha512t24u)?;
+        let relpath_str = relpath
+            .to_str()
+            .ok_or_else(|| anyhow!("Non-UTF8 sequence path"))?;
+        Self::fetch_file(&self.local_path, &self.remote_source, relpath_str, true, false)?;
+        Ok(())
+    }
 
     /// Resolve the relative on-disk/remote path for a sequence's encoded bytes.
     fn resolve_seq_file_relpath(&self, digest: &str) -> Result<PathBuf> {
@@ -3127,11 +3170,11 @@ StorageMode::Raw => Ok(sequence[start..end].to_vec()),
                 if let Some(local_path) = local_path {
                     let full_local_path = local_path.join(relative_path);
 
-                    if let Some(parent) = full_local_path.parent() {
-                        create_dir_all(parent)?;
-                    }
-
-                    fs::write(&full_local_path, &data).context(format!(
+                    // Published by rename: other processes sharing this cache
+                    // directory test for the file and read it, so they must
+                    // never see it partly written, and a process killed mid-write
+                    // must not leave a truncated file the cache then trusts.
+                    atomic_write_bytes(&full_local_path, &data).context(format!(
                         "Failed to cache file to: {}",
                         full_local_path.display()
                     ))?;

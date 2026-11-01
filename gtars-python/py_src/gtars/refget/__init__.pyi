@@ -697,6 +697,26 @@ class RefgetStore:
         """
         ...
 
+    def set_cache_whole_sequences(self, cache_whole_sequences: bool) -> None:
+        """Set whether a substring read of an uncached remote sequence downloads its whole file.
+
+        By default such a read requests only the bytes it covers. With this
+        set, the read downloads the sequence's file into the cache directory
+        once, then reads it and every later range from disk, without holding
+        the sequence in memory. Processes sharing the cache directory then
+        download each sequence once between them. Has no effect on a store
+        without a remote source.
+
+        Args:
+            cache_whole_sequences: Whether to download whole sequence files on a miss.
+
+        Example::
+
+            store = RefgetStore.open_remote("/tmp/cache", "https://example.org/store")
+            store.set_cache_whole_sequences(True)
+        """
+        ...
+
     def enable_persistence(self, path: Union[str, PathLike]) -> None:
         """Enable disk persistence for this store.
 

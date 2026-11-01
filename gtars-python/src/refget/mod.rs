@@ -1588,6 +1588,26 @@ impl PyRefgetStore {
         self.inner.set_quiet(quiet);
     }
 
+    /// Set whether a substring read of a remote sequence that is not cached
+    /// yet downloads its whole sequence file into the cache directory.
+    ///
+    /// By default such a read requests only the bytes it covers. With this
+    /// set, the read downloads the sequence's file once, then reads it and
+    /// every later range from disk, without holding the sequence in memory.
+    /// Processes sharing the cache directory then download each sequence once
+    /// between them. Has no effect on a store without a remote source.
+    ///
+    /// Args:
+    ///     cache_whole_sequences (bool): Whether to download whole sequence
+    ///         files on a miss.
+    ///
+    /// Example:
+    ///     >>> store = RefgetStore.open_remote("/tmp/cache", "https://example.org/store")
+    ///     >>> store.set_cache_whole_sequences(True)
+    fn set_cache_whole_sequences(&mut self, cache_whole_sequences: bool) {
+        self.inner.set_cache_whole_sequences(cache_whole_sequences);
+    }
+
     /// Returns whether the store is in quiet mode.
     ///
     /// Returns:

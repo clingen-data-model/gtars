@@ -72,6 +72,13 @@ name = "concurrent_store_writers"
 required-features = ["filesystem"]
 harness = false
 
+# Spawns real processes reading one remote store through one cache directory,
+# served over HTTP by the test itself. `harness = false` for the same reason.
+[[test]]
+name = "shared_remote_cache"
+required-features = ["filesystem", "http"]
+harness = false
+
 [[example]]
 name = "bench_fasta"
 required-features = ["filesystem"]
