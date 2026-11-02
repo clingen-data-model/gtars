@@ -77,6 +77,9 @@ const RGSI_HEADER: &str = "#name\tlength\talphabet\tsha512t24u\tmd5\tdescription
 /// Header line of a `collections.rgci` file.
 const RGCI_HEADER: &str = "#digest\tn_sequences\tnames_digest\tsequences_digest\tlengths_digest\tname_length_pairs_digest\tsorted_name_length_pairs_digest\tsorted_sequences_digest";
 
+/// Longest pause between attempts to take a remote cache's open lock.
+const OPEN_LOCK_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
 fn remove_cached_artifact(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path)
@@ -871,7 +874,14 @@ impl ReadonlyRefgetStore {
         // (all of them on a cold cache), which must not happen while another
         // process is fetching or loading those files. Held until this returns;
         // the next opener then finds the cache current and deletes nothing.
-        let _open_lock = StoreLock::acquire(cache_path, "open_remote", LockOptions::default())?;
+        // Opens hold it briefly and several processes start together, so
+        // waiters retry often: at the default back-off they take it seconds
+        // apart.
+        let _open_lock = StoreLock::acquire(
+            cache_path,
+            "open_remote",
+            LockOptions::default().max_backoff(OPEN_LOCK_MAX_BACKOFF),
+        )?;
 
         let origin_path = cache_path.join(".origin");
         match fs::read_to_string(&origin_path) {

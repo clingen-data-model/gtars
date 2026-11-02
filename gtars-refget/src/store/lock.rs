@@ -137,6 +137,9 @@ pub struct LockOptions {
     /// Break any existing lock immediately, without waiting. Operator escape
     /// hatch (`--force-unlock`); do not set this by default.
     pub force: bool,
+    /// Longest pause between attempts while the lock is held. A waiter takes
+    /// the lock up to this long after its holder releases it.
+    pub max_backoff: Duration,
 }
 
 impl Default for LockOptions {
@@ -148,6 +151,7 @@ impl Default for LockOptions {
                 .flatten()
                 .unwrap_or(Duration::from_secs(DEFAULT_STALE_AFTER_SECS)),
             force: false,
+            max_backoff: BACKOFF_MAX,
         }
     }
 }
@@ -174,6 +178,12 @@ impl LockOptions {
     #[must_use]
     pub fn force(mut self, force: bool) -> Self {
         self.force = force;
+        self
+    }
+
+    #[must_use]
+    pub fn max_backoff(mut self, max_backoff: Duration) -> Self {
+        self.max_backoff = max_backoff;
         self
     }
 }
@@ -214,7 +224,7 @@ impl StoreLock {
         }
 
         let deadline = opts.timeout.map(|t| SystemTime::now() + t);
-        let mut backoff = BACKOFF_START;
+        let mut backoff = BACKOFF_START.min(opts.max_backoff);
 
         loop {
             match try_create(&path, operation) {
@@ -281,7 +291,7 @@ impl StoreLock {
             }
 
             std::thread::sleep(backoff);
-            backoff = std::cmp::min(backoff * 2, BACKOFF_MAX);
+            backoff = std::cmp::min(backoff * 2, opts.max_backoff);
         }
     }
 
