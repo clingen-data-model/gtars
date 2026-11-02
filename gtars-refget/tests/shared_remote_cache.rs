@@ -140,6 +140,10 @@ fn main() {
             "sequences_cached_ahead_leave_readers_nothing_to_fetch",
             sequences_cached_ahead_leave_readers_nothing_to_fetch,
         ),
+        (
+            "dropped_refused_and_stalled_downloads_are_retried",
+            dropped_refused_and_stalled_downloads_are_retried,
+        ),
     ];
 
     println!("\nrunning {} tests", tests.len());
@@ -174,10 +178,31 @@ fn build_remote_store(store_dir: &Path, work: &Path) {
 /// Requests served, by path, with whether each asked for a byte range.
 type RequestLog = Arc<Mutex<HashMap<String, (usize, usize)>>>;
 
+/// A failure the server answers a request with instead of the file.
+#[derive(Clone, Copy, Debug)]
+enum Fault {
+    /// Close the connection without a response.
+    Drop,
+    /// 503 Service Unavailable.
+    Unavailable,
+    /// Send the headers and the first chunk of the body, then nothing more for
+    /// a minute.
+    Stall,
+}
+
+/// Faults still to inject, per request path, in order: the next request for a
+/// path gets the first fault queued for it.
+type Faults = Arc<Mutex<HashMap<String, std::collections::VecDeque<Fault>>>>;
+
 /// Serve `root` over HTTP, honoring single `Range: bytes=a-b` requests. Bodies
 /// are written in chunks with a pause between them, as a real network would
 /// deliver them, so concurrent children overlap in their fetches.
 fn serve(root: PathBuf) -> (String, RequestLog) {
+    serve_with_faults(root, Faults::default())
+}
+
+/// [`serve`], answering requests with the queued `faults` first.
+fn serve_with_faults(root: PathBuf, faults: Faults) -> (String, RequestLog) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let log: RequestLog = Arc::default();
@@ -186,13 +211,14 @@ fn serve(root: PathBuf) -> (String, RequestLog) {
         for stream in listener.incoming().flatten() {
             let root = root.clone();
             let log = Arc::clone(&thread_log);
-            std::thread::spawn(move || respond(stream, &root, &log));
+            let faults = Arc::clone(&faults);
+            std::thread::spawn(move || respond(stream, &root, &log, &faults));
         }
     });
     (url, log)
 }
 
-fn respond(stream: TcpStream, root: &Path, log: &RequestLog) {
+fn respond(stream: TcpStream, root: &Path, log: &RequestLog, faults: &Faults) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut request_line = String::new();
     if reader.read_line(&mut request_line).is_err() {
@@ -218,7 +244,16 @@ fn respond(stream: TcpStream, root: &Path, log: &RequestLog) {
         entry.0 += 1;
         entry.1 += range.is_some() as usize;
     }
+    let fault = faults.lock().unwrap().get_mut(&path).and_then(|queue| queue.pop_front());
     let mut stream = stream;
+    match fault {
+        Some(Fault::Drop) => return,
+        Some(Fault::Unavailable) => {
+            let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            return;
+        }
+        _ => {}
+    }
     let body = match std::fs::read(root.join(path.trim_start_matches('/'))) {
         Ok(body) => body,
         Err(_) => {
@@ -246,6 +281,10 @@ fn respond(stream: TcpStream, root: &Path, log: &RequestLog) {
     }
     for chunk in body.chunks(256 * 1024) {
         if stream.write_all(chunk).is_err() {
+            return;
+        }
+        if matches!(fault, Some(Fault::Stall)) {
+            std::thread::sleep(std::time::Duration::from_secs(60));
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -387,6 +426,46 @@ fn range_reads_fetch_byte_ranges_by_default() {
     let mut cached = Vec::new();
     cached_seq_files(&cache, &cache, &mut cached);
     assert_eq!(cached, Vec::<PathBuf>::new());
+}
+
+/// A download whose connection is dropped, that is refused with a 503, or whose
+/// body stalls is retried rather than failing the read or blocking it forever:
+/// both the readers sharing the cache and `cache_sequences` get the file.
+fn dropped_refused_and_stalled_downloads_are_retried() {
+    let work = tempfile::tempdir().unwrap();
+    let remote_dir = work.path().join("remote");
+    build_remote_store(&remote_dir, work.path());
+    let mut remote_seqs = Vec::new();
+    cached_seq_files(&remote_dir, &remote_dir, &mut remote_seqs);
+    let path_of = |digest: &str| {
+        let seq = remote_seqs.iter().find(|p| p.file_stem().is_some_and(|s| s == digest)).unwrap();
+        format!("/{}", seq.display())
+    };
+    let expected = expected();
+    let (big, mid) = (path_of(&expected[0].1), path_of(&expected[1].1));
+    let faults = Faults::default();
+    faults.lock().unwrap().insert(big.clone(), [Fault::Drop, Fault::Unavailable, Fault::Stall].into());
+    faults.lock().unwrap().insert(mid.clone(), [Fault::Stall].into());
+    let (remote, log) = serve_with_faults(remote_dir, Arc::clone(&faults));
+    let timeout = [("GTARS_HTTP_BODY_TIMEOUT", "1")];
+
+    // Readers: the claimant of each faulty file retries through its faults.
+    let cache = run_round(&remote, work.path(), 0, "ranges", &timeout);
+    assert_eq!(transient_files(&cache), Vec::<PathBuf>::new());
+    let requests = |path: &str| log.lock().unwrap().get(path).map_or(0, |e| e.0);
+    assert_eq!((requests(&big), requests(&mid)), (4, 2));
+
+    // cache_sequences, on a fresh cache: the same faults again.
+    faults.lock().unwrap().insert(big.clone(), [Fault::Stall, Fault::Drop].into());
+    // SAFETY: no other thread of this process reads the environment now.
+    unsafe { std::env::set_var("GTARS_HTTP_BODY_TIMEOUT", "1") };
+    let mut store = RefgetStore::open_remote(work.path().join("cache-ahead"), &remote).unwrap();
+    store.set_quiet(true);
+    let digests: Vec<String> = expected.iter().map(|(_, d, _)| d.clone()).collect();
+    let report = store.cache_sequences(&digests, 4).unwrap();
+    unsafe { std::env::remove_var("GTARS_HTTP_BODY_TIMEOUT") };
+    assert_eq!((report.cached, report.failed.len()), (SEQUENCES.len(), 0), "{:?}", report.failed);
+    assert_eq!(requests(&big), 4 + 3);
 }
 
 /// `cache_sequences` fetches every sequence it is given once, reports an

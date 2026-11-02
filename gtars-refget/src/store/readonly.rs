@@ -117,6 +117,47 @@ const DOWNLOAD_CHUNK: usize = 1 << 20;
 #[cfg(feature = "http")]
 const DOWNLOAD_PRESIZE_MAX: usize = 4 << 30;
 
+/// Attempts at a whole-file download before its error is returned, and the
+/// pause before the second (doubling after).
+#[cfg(feature = "http")]
+const DOWNLOAD_ATTEMPTS: u32 = 4;
+#[cfg(feature = "http")]
+const DOWNLOAD_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Longest a whole-file download may take to deliver its body before it is
+/// abandoned and retried. `GTARS_HTTP_BODY_TIMEOUT` (seconds) overrides it.
+#[cfg(feature = "http")]
+const DOWNLOAD_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The HTTP client every remote request shares. One client keeps connections
+/// to the remote open between requests instead of opening one per file, and
+/// bounds every wait: ureq's own defaults have no timeouts, so one stalled
+/// connection would block its read forever. Responses must start within 60 s
+/// and connections open within 30 s; whole-file bodies are bounded per request
+/// (see [`ReadonlyRefgetStore::download`]).
+#[cfg(feature = "http")]
+fn http_agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::Agent::config_builder()
+            .timeout_connect(Some(std::time::Duration::from_secs(30)))
+            .timeout_recv_response(Some(std::time::Duration::from_secs(60)))
+            .max_idle_connections(128)
+            .max_idle_connections_per_host(128)
+            .build()
+            .into()
+    })
+}
+
+#[cfg(feature = "http")]
+fn download_body_timeout() -> Option<std::time::Duration> {
+    match std::env::var("GTARS_HTTP_BODY_TIMEOUT").ok().and_then(|v| v.trim().parse::<f64>().ok()) {
+        Some(secs) if secs <= 0.0 => None,
+        Some(secs) => Some(std::time::Duration::from_secs_f64(secs)),
+        None => Some(DOWNLOAD_BODY_TIMEOUT),
+    }
+}
+
 /// What [`ReadonlyRefgetStore::cache_sequences`] did.
 #[derive(Debug, Default, Clone)]
 pub struct CacheReport {
@@ -280,12 +321,8 @@ fn open_remote_range(
 
     let byte_len = byte_end - byte_start;
     let last_byte = byte_end.saturating_sub(1);
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_connect(Some(std::time::Duration::from_secs(30)))
-        .timeout_recv_response(Some(std::time::Duration::from_secs(60)))
-        .build()
-        .into();
-    let response = agent
+    // No body timeout: the caller streams the body at its own pace.
+    let response = http_agent()
         .get(&url)
         .header("Range", &format!("bytes={}-{}", byte_start, last_byte))
         .call()
@@ -3330,11 +3367,57 @@ StorageMode::Raw => Ok(sequence[start..end].to_vec()),
     }
 
     /// GET `url` into memory, touching `claim` as bytes arrive.
+    ///
+    /// A failure the remote or the network may not repeat (a reset or failed
+    /// connection, a timeout, HTTP 429 or 5xx, a body cut short) is retried, up
+    /// to [`DOWNLOAD_ATTEMPTS`] attempts with doubling pauses; any other, such
+    /// as a 404, is returned at once.
     #[cfg(feature = "http")]
     fn download(url: &str, mut claim: Option<&mut FetchClaim>) -> Result<Vec<u8>> {
-        let response = ureq::get(url)
+        let mut pause = DOWNLOAD_RETRY_PAUSE;
+        for attempt in 1.. {
+            match Self::download_once(url, claim.as_deref_mut()) {
+                Ok(data) => return Ok(data),
+                Err((_, true)) if attempt < DOWNLOAD_ATTEMPTS => {
+                    if let Some(claim) = claim.as_deref_mut() {
+                        claim.touch();
+                    }
+                    std::thread::sleep(pause);
+                    pause *= 2;
+                }
+                Err((error, _)) => {
+                    return Err(error.context(format!("after {attempt} attempt(s)")));
+                }
+            }
+        }
+        unreachable!("the loop returns on its last attempt")
+    }
+
+    /// One attempt of [`download`](Self::download): the error, and whether it
+    /// is worth retrying.
+    #[cfg(feature = "http")]
+    fn download_once(
+        url: &str,
+        mut claim: Option<&mut FetchClaim>,
+    ) -> std::result::Result<Vec<u8>, (anyhow::Error, bool)> {
+        let response = http_agent()
+            .get(url)
+            .config()
+            .timeout_recv_body(download_body_timeout())
+            .build()
             .call()
-            .map_err(|e| anyhow!("Failed to fetch from remote: {}", e))?;
+            .map_err(|e| {
+                let transient = match &e {
+                    ureq::Error::StatusCode(code) => *code == 429 || *code >= 500,
+                    ureq::Error::Io(_)
+                    | ureq::Error::Timeout(_)
+                    | ureq::Error::ConnectionFailed
+                    | ureq::Error::HostNotFound
+                    | ureq::Error::Protocol(_) => true,
+                    _ => false,
+                };
+                (anyhow!("Failed to fetch from remote: {}", e), transient)
+            })?;
         let length = response
             .headers()
             .get("content-length")
@@ -3348,7 +3431,7 @@ StorageMode::Raw => Ok(sequence[start..end].to_vec()),
         loop {
             let n = reader
                 .read(&mut chunk)
-                .context("Failed to read response body")?;
+                .map_err(|e| (anyhow!("Failed to read response body from {}: {}", url, e), true))?;
             if n == 0 {
                 break;
             }
@@ -3356,6 +3439,12 @@ StorageMode::Raw => Ok(sequence[start..end].to_vec()),
             if let Some(claim) = claim.as_deref_mut() {
                 claim.touch();
             }
+        }
+        if let Some(expected) = length.filter(|&expected| expected != data.len()) {
+            return Err((
+                anyhow!("Body from {} ended after {} of {} bytes", url, data.len(), expected),
+                true,
+            ));
         }
         Ok(data)
     }
