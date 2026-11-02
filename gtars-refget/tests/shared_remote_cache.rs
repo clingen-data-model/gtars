@@ -136,6 +136,10 @@ fn main() {
             "an_abandoned_fetch_marker_only_delays_readers",
             an_abandoned_fetch_marker_only_delays_readers,
         ),
+        (
+            "sequences_cached_ahead_leave_readers_nothing_to_fetch",
+            sequences_cached_ahead_leave_readers_nothing_to_fetch,
+        ),
     ];
 
     println!("\nrunning {} tests", tests.len());
@@ -383,6 +387,34 @@ fn range_reads_fetch_byte_ranges_by_default() {
     let mut cached = Vec::new();
     cached_seq_files(&cache, &cache, &mut cached);
     assert_eq!(cached, Vec::<PathBuf>::new());
+}
+
+/// `cache_sequences` fetches every sequence it is given once, reports an
+/// unknown digest instead of failing, and leaves readers of the cache nothing
+/// to download.
+fn sequences_cached_ahead_leave_readers_nothing_to_fetch() {
+    let work = tempfile::tempdir().unwrap();
+    let remote_dir = work.path().join("remote");
+    build_remote_store(&remote_dir, work.path());
+    let (remote, log) = serve(remote_dir);
+    let cache = work.path().join("cache-ranges-0");
+
+    let mut digests: Vec<String> = expected().into_iter().map(|(_, d, _)| format!("SQ.{d}")).collect();
+    digests.push(digests[0].clone());
+    digests.push("SQ.notASequenceDigestAtAll0000000".to_string());
+    let mut store = RefgetStore::open_remote(&cache, &remote).unwrap();
+    store.set_quiet(true);
+    let report = store.cache_sequences(&digests, 3).unwrap();
+    assert_eq!(report.requested, SEQUENCES.len() + 2);
+    assert_eq!((report.distinct, report.already_cached, report.cached), (SEQUENCES.len(), 0, SEQUENCES.len()));
+    assert_eq!(report.failed.len(), 1);
+    assert_eq!(seq_requests(&log), (SEQUENCES.len(), 0));
+    let again = store.cache_sequences(&digests, 3).unwrap();
+    assert_eq!((again.already_cached, again.cached), (SEQUENCES.len(), 0));
+    drop(store);
+
+    run_round(&remote, work.path(), 0, "ranges", &[]);
+    assert_eq!(seq_requests(&log), (SEQUENCES.len(), 0), "readers fetched a sequence");
 }
 
 /// A fetch marker left by a process that died mid-download delays the readers

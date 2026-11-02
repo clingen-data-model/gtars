@@ -717,6 +717,28 @@ class RefgetStore:
         """
         ...
 
+    def cache_sequences(self, digests: List[str], threads: int = 8) -> Dict[str, Any]:
+        """Download the sequence files of a remote store's sequences into its cache directory.
+
+        Several at a time, largest first, without loading them: for a caller
+        that knows ahead of time which sequences it will read. Sequences
+        already cached are skipped, and one another process sharing the cache
+        directory is downloading is waited for. Runs without holding the GIL.
+
+        Args:
+            digests: SHA-512/24u, "SQ."-prefixed or MD5 digests.
+            threads: Concurrent downloads.
+
+        Returns:
+            "requested", "distinct", "already_cached" and "cached" counts,
+            "cached_bytes", and "failed": (digest, reason) pairs for digests
+            not resolved or not downloaded.
+
+        Raises:
+            IOError: If the store is not remote, or its sequence index cannot be loaded.
+        """
+        ...
+
     def enable_persistence(self, path: Union[str, PathLike]) -> None:
         """Enable disk persistence for this store.
 

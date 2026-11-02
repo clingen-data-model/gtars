@@ -356,6 +356,18 @@ impl RefgetStore {
         self.inner.set_cache_whole_sequences(cache_whole_sequences);
     }
 
+    /// Fetch the `.seq` files of `digests` into the cache directory without
+    /// loading them, loading the sequence index first (see
+    /// [`ReadonlyRefgetStore::cache_sequences`]).
+    pub fn cache_sequences(
+        &mut self,
+        digests: &[String],
+        threads: usize,
+    ) -> Result<super::CacheReport> {
+        self.inner.ensure_sequence_index_loaded()?;
+        self.inner.cache_sequences(digests, threads)
+    }
+
     /// Change the storage mode.
     ///
     /// Switching to Encoded fails, leaving the store unchanged, if a sequence

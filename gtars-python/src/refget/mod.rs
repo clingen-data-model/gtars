@@ -1608,6 +1608,47 @@ impl PyRefgetStore {
         self.inner.set_cache_whole_sequences(cache_whole_sequences);
     }
 
+    /// Download the sequence files of a remote store's sequences into its
+    /// cache directory, several at a time, without loading them.
+    ///
+    /// For a caller that knows ahead of time which sequences it will read.
+    /// Largest first. Sequences already cached are skipped, and one another
+    /// process sharing the cache directory is downloading is waited for.
+    /// Runs without holding the GIL.
+    ///
+    /// Args:
+    ///     digests (list[str]): SHA-512/24u, "SQ."-prefixed or MD5 digests.
+    ///     threads (int): Concurrent downloads (default: 8).
+    ///
+    /// Returns:
+    ///     dict: "requested", "distinct", "already_cached" and "cached"
+    ///     counts, "cached_bytes", and "failed": (digest, reason) pairs for
+    ///     digests not resolved or not downloaded.
+    ///
+    /// Raises:
+    ///     IOError: If the store is not remote, or its sequence index cannot
+    ///         be loaded.
+    #[pyo3(signature = (digests, threads = 8))]
+    fn cache_sequences(
+        &mut self,
+        py: Python<'_>,
+        digests: Vec<String>,
+        threads: usize,
+    ) -> PyResult<Py<pyo3::types::PyDict>> {
+        let store = &mut self.inner;
+        let report = py
+            .detach(|| store.cache_sequences(&digests, threads))
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("{e:#}")))?;
+        let out = pyo3::types::PyDict::new(py);
+        out.set_item("requested", report.requested)?;
+        out.set_item("distinct", report.distinct)?;
+        out.set_item("already_cached", report.already_cached)?;
+        out.set_item("cached", report.cached)?;
+        out.set_item("cached_bytes", report.cached_bytes)?;
+        out.set_item("failed", report.failed)?;
+        Ok(out.into())
+    }
+
     /// Returns whether the store is in quiet mode.
     ///
     /// Returns:

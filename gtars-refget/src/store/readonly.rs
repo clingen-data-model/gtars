@@ -117,6 +117,24 @@ const DOWNLOAD_CHUNK: usize = 1 << 20;
 #[cfg(feature = "http")]
 const DOWNLOAD_PRESIZE_MAX: usize = 4 << 30;
 
+/// What [`ReadonlyRefgetStore::cache_sequences`] did.
+#[derive(Debug, Default, Clone)]
+pub struct CacheReport {
+    /// Digests asked for, duplicates and unresolvable ones included.
+    pub requested: usize,
+    /// Distinct sequences they resolved to.
+    pub distinct: usize,
+    /// Of those, already in the cache directory when the call began.
+    pub already_cached: usize,
+    /// Of those, in the cache directory when the call returned that were not
+    /// before: fetched by this call, or by another process it waited for.
+    pub cached: usize,
+    /// Size of the `cached` files.
+    pub cached_bytes: u64,
+    /// Digests not resolved or not fetched, with the reason.
+    pub failed: Vec<(String, String)>,
+}
+
 /// Convert decoded sequence bytes into a `String` without re-validating UTF-8.
 ///
 /// # Why this exists
@@ -2898,6 +2916,77 @@ StorageMode::Raw => Ok(sequence[start..end].to_vec()),
             .to_str()
             .ok_or_else(|| anyhow!("Non-UTF8 sequence path"))?;
         Self::cache_file(&self.local_path, &self.remote_source, relpath_str)
+    }
+
+    /// Fetch the `.seq` files of `digests` into the cache directory, `threads`
+    /// at a time, without loading them: for a caller that knows ahead of time
+    /// which sequences it will read. Accepts SHA-512/24u, `SQ.`-prefixed and
+    /// MD5 digests. Largest first, so the slowest downloads start earliest.
+    ///
+    /// A sequence that cannot be resolved or fetched is reported in
+    /// [`CacheReport::failed`] rather than failing the call. Processes sharing
+    /// the cache directory coordinate as for any fetch, so a sequence another
+    /// process is fetching is waited for, not fetched again. The sequence
+    /// index must be loaded.
+    pub fn cache_sequences(&self, digests: &[String], threads: usize) -> Result<CacheReport> {
+        if self.remote_source.is_none() || self.local_path.is_none() {
+            return Err(anyhow!("cache_sequences needs a remote store with a cache directory"));
+        }
+        let mut report = CacheReport {
+            requested: digests.len(),
+            ..CacheReport::default()
+        };
+        let mut seen = HashSet::new();
+        let mut pending = Vec::new();
+        for digest in digests {
+            let meta = match self.get_sequence(crate::digest::strip_sq_prefix(digest)) {
+                Ok(record) => record.metadata().clone(),
+                Err(e) => {
+                    report.failed.push((digest.clone(), format!("{e:#}")));
+                    continue;
+                }
+            };
+            if !seen.insert(meta.sha512t24u.clone()) {
+                continue;
+            }
+            if self
+                .sequence_file_path(&meta.sha512t24u)
+                .is_some_and(|path| path.exists())
+            {
+                report.already_cached += 1;
+            } else {
+                pending.push(meta);
+            }
+        }
+        report.distinct = seen.len();
+        pending.sort_by(|a, b| b.length.cmp(&a.length));
+
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let outcomes = Mutex::new(Vec::with_capacity(pending.len()));
+        std::thread::scope(|scope| {
+            for _ in 0..threads.max(1).min(pending.len().max(1)) {
+                scope.spawn(|| loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(meta) = pending.get(i) else { break };
+                    let outcome = self.cache_sequence_file(meta).map(|()| {
+                        self.sequence_file_path(&meta.sha512t24u)
+                            .and_then(|path| fs::metadata(path).ok())
+                            .map_or(0, |m| m.len())
+                    });
+                    outcomes.lock().unwrap().push((meta.sha512t24u.clone(), outcome));
+                });
+            }
+        });
+        for (digest, outcome) in outcomes.into_inner().unwrap() {
+            match outcome {
+                Ok(bytes) => {
+                    report.cached += 1;
+                    report.cached_bytes += bytes;
+                }
+                Err(e) => report.failed.push((digest, format!("{e:#}"))),
+            }
+        }
+        Ok(report)
     }
 
     /// Resolve the relative on-disk/remote path for a sequence's encoded bytes.

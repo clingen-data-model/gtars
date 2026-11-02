@@ -164,7 +164,7 @@ mod nofs_tests {
 }
 
 // Re-export public types from submodules
-pub use self::readonly::{PendingChanges, ReadonlyRefgetStore};
+pub use self::readonly::{CacheReport, PendingChanges, ReadonlyRefgetStore};
 pub use self::core::RefgetStore;
 pub use self::alias::{AliasKind, AliasManager};
 pub use self::atomic::is_transient_store_file;
