@@ -90,6 +90,8 @@ mod readonly;
 mod core;
 mod alias;
 pub(crate) mod atomic;
+#[cfg(feature = "http")]
+mod fetch_marker;
 mod fhr_metadata;
 mod lock;
 // FASTA import (crossbeam-channel) and export (gtars-core) are filesystem-only.

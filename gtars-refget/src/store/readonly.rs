@@ -2,7 +2,10 @@
 
 use super::*;
 use super::alias::AliasManager;
+#[cfg(feature = "http")]
 use super::atomic::atomic_write_bytes;
+#[cfg(feature = "http")]
+use super::fetch_marker::{FetchClaim, Waited, remove_abandoned_marker, wait_for_fetch};
 use super::lock::{LockOptions, StoreLock};
 
 use std::collections::{HashMap, HashSet};
@@ -105,6 +108,14 @@ fn is_missing_seq_file(err: &anyhow::Error) -> bool {
 /// bytes is cheaper than pulling a whole chromosome. Heuristic, count-based:
 /// small/ad-hoc reads stay lean, bulk reads promote.
 const REMOTE_BULK_FETCH_THRESHOLD: usize = 16;
+
+/// Read size for remote downloads, and so the granularity of fetch-marker touches.
+#[cfg(feature = "http")]
+const DOWNLOAD_CHUNK: usize = 1 << 20;
+
+/// Largest download buffer allocated up front from a response's Content-Length.
+#[cfg(feature = "http")]
+const DOWNLOAD_PRESIZE_MAX: usize = 4 << 30;
 
 /// Convert decoded sequence bytes into a `String` without re-validating UTF-8.
 ///
@@ -2886,8 +2897,7 @@ StorageMode::Raw => Ok(sequence[start..end].to_vec()),
         let relpath_str = relpath
             .to_str()
             .ok_or_else(|| anyhow!("Non-UTF8 sequence path"))?;
-        Self::fetch_file(&self.local_path, &self.remote_source, relpath_str, true, false)?;
-        Ok(())
+        Self::cache_file(&self.local_path, &self.remote_source, relpath_str)
     }
 
     /// Resolve the relative on-disk/remote path for a sequence's encoded bytes.
@@ -3133,17 +3143,49 @@ StorageMode::Raw => Ok(sequence[start..end].to_vec()),
         persist_to_disk: bool,
         force_refresh: bool,
     ) -> Result<Vec<u8>> {
+        Self::fetch(local_path, remote_source, relative_path, persist_to_disk, force_refresh, true)?
+            .ok_or_else(|| anyhow!("No data fetched for {}", relative_path))
+    }
+
+    /// Make sure a file is in the cache directory, fetching it if it is not,
+    /// without reading it: [`fetch_file`](Self::fetch_file) for callers that
+    /// read the cached file themselves.
+    pub(crate) fn cache_file(
+        local_path: &Option<PathBuf>,
+        remote_source: &Option<String>,
+        relative_path: &str,
+    ) -> Result<()> {
+        Self::fetch(local_path, remote_source, relative_path, true, false, false).map(|_| ())
+    }
+
+    /// [`fetch_file`](Self::fetch_file), returning the bytes only if
+    /// `want_data`.
+    fn fetch(
+        local_path: &Option<PathBuf>,
+        remote_source: &Option<String>,
+        relative_path: &str,
+        persist_to_disk: bool,
+        force_refresh: bool,
+        want_data: bool,
+    ) -> Result<Option<Vec<u8>>> {
         Self::sanitize_relative_path(relative_path)?;
 
-        if persist_to_disk && !force_refresh {
-            if let Some(local_path) = local_path {
-                let full_local_path = local_path.join(relative_path);
-                if full_local_path.exists() {
-                    return fs::read(&full_local_path).context(format!(
-                        "Failed to read local file: {}",
-                        full_local_path.display()
-                    ));
-                }
+        let cached = local_path
+            .as_ref()
+            .filter(|_| persist_to_disk)
+            .map(|p| p.join(relative_path));
+        let read_cached = |path: &Path| -> Result<Option<Vec<u8>>> {
+            if !want_data {
+                return Ok(None);
+            }
+            fs::read(path)
+                .map(Some)
+                .context(format!("Failed to read local file: {}", path.display()))
+        };
+
+        if let Some(path) = cached.as_ref().filter(|_| !force_refresh) {
+            if path.exists() {
+                return read_cached(path);
             }
         }
 
@@ -3155,40 +3197,89 @@ StorageMode::Raw => Ok(sequence[start..end].to_vec()),
                 format!("{}/{}", remote_url, relative_path)
             };
 
-            let response = ureq::get(&full_remote_url)
-                .call()
-                .map_err(|e| anyhow!("Failed to fetch from remote: {}", e))?;
-
-            let mut data = Vec::new();
-            response
-                .into_body()
-                .into_reader()
-                .read_to_end(&mut data)
-                .context("Failed to read response body")?;
-
-            if persist_to_disk {
-                if let Some(local_path) = local_path {
-                    let full_local_path = local_path.join(relative_path);
-
-                    // Published by rename: other processes sharing this cache
-                    // directory test for the file and read it, so they must
-                    // never see it partly written, and a process killed mid-write
-                    // must not leave a truncated file the cache then trusts.
-                    atomic_write_bytes(&full_local_path, &data).context(format!(
-                        "Failed to cache file to: {}",
-                        full_local_path.display()
-                    ))?;
-                }
+            let Some(path) = cached else {
+                return Self::download(&full_remote_url, None).map(Some);
+            };
+            if force_refresh {
+                let data = Self::download(&full_remote_url, None)?;
+                Self::publish_cached(&path, &data)?;
+                return Ok(Some(data));
             }
 
-            return Ok(data);
+            // Processes sharing this cache directory fetch each file once
+            // between them: one claims it and downloads it, the others wait
+            // for it to be published (see `fetch_marker`).
+            loop {
+                if let Some(mut claim) = FetchClaim::try_claim(&path)? {
+                    // The previous claimant published it just before this claim.
+                    if path.exists() {
+                        drop(claim);
+                        return read_cached(&path);
+                    }
+                    let data = Self::download(&full_remote_url, Some(&mut claim))?;
+                    Self::publish_cached(&path, &data)?;
+                    return Ok(want_data.then_some(data));
+                }
+                match wait_for_fetch(&path) {
+                    Waited::Published => return read_cached(&path),
+                    Waited::Released => continue,
+                    Waited::Abandoned(judged) => {
+                        let data = Self::download(&full_remote_url, None)?;
+                        Self::publish_cached(&path, &data)?;
+                        remove_abandoned_marker(&path, judged);
+                        return Ok(want_data.then_some(data));
+                    }
+                }
+            }
         }
 
-        let _ = remote_source;
+        let _ = (remote_source, want_data);
         Err(anyhow!(
             "File not found locally and no remote source configured: {}",
             relative_path
         ))
+    }
+
+    /// GET `url` into memory, touching `claim` as bytes arrive.
+    #[cfg(feature = "http")]
+    fn download(url: &str, mut claim: Option<&mut FetchClaim>) -> Result<Vec<u8>> {
+        let response = ureq::get(url)
+            .call()
+            .map_err(|e| anyhow!("Failed to fetch from remote: {}", e))?;
+        let length = response
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<usize>().ok());
+        let mut reader = response.into_body().into_reader();
+        // Sized up front when the length is known, so a cached sequence does
+        // not keep the slack of a doubling buffer.
+        let mut data = Vec::with_capacity(length.unwrap_or(0).min(DOWNLOAD_PRESIZE_MAX));
+        let mut chunk = vec![0u8; DOWNLOAD_CHUNK];
+        loop {
+            let n = reader
+                .read(&mut chunk)
+                .context("Failed to read response body")?;
+            if n == 0 {
+                break;
+            }
+            data.extend_from_slice(&chunk[..n]);
+            if let Some(claim) = claim.as_deref_mut() {
+                claim.touch();
+            }
+        }
+        Ok(data)
+    }
+
+    /// Publish fetched bytes into the cache directory.
+    #[cfg(feature = "http")]
+    fn publish_cached(path: &Path, data: &[u8]) -> Result<()> {
+        // Published by rename: other processes sharing this cache directory
+        // test for the file and read it, so they must never see it partly
+        // written, and a process killed mid-write must not leave a truncated
+        // file the cache then trusts.
+        atomic_write_bytes(path, data)
+            .context(format!("Failed to cache file to: {}", path.display()))
     }
 
     /// Ensure a collection is loaded into the store

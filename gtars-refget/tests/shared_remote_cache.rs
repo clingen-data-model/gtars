@@ -132,6 +132,10 @@ fn main() {
             "range_reads_fetch_byte_ranges_by_default",
             range_reads_fetch_byte_ranges_by_default,
         ),
+        (
+            "an_abandoned_fetch_marker_only_delays_readers",
+            an_abandoned_fetch_marker_only_delays_readers,
+        ),
     ];
 
     println!("\nrunning {} tests", tests.len());
@@ -244,11 +248,12 @@ fn respond(stream: TcpStream, root: &Path, log: &RequestLog) {
     }
 }
 
-fn spawn_reader(remote: &str, cache: &Path, mode: &str) -> std::process::Child {
+fn spawn_reader(remote: &str, cache: &Path, mode: &str, envs: &[(&str, &str)]) -> std::process::Child {
     Command::new(std::env::current_exe().unwrap())
         .env(CHILD_REMOTE, remote)
         .env(CHILD_CACHE, cache)
         .env(CHILD_MODE, mode)
+        .envs(envs.iter().copied())
         .spawn()
         .expect("failed to spawn reader child")
 }
@@ -259,12 +264,12 @@ fn spawn_reader(remote: &str, cache: &Path, mode: &str) -> std::process::Child {
 /// Readers started together all miss the cache and fetch for themselves; the
 /// races are met by a reader that arrives while another is mid-publish or
 /// mid-open, so each round staggers the starts differently.
-fn run_round(remote: &str, work: &Path, round: usize, mode: &str) -> PathBuf {
+fn run_round(remote: &str, work: &Path, round: usize, mode: &str, envs: &[(&str, &str)]) -> PathBuf {
     let cache = work.join(format!("cache-{mode}-{round}"));
     let stagger = std::time::Duration::from_millis(STAGGER_MS[round % STAGGER_MS.len()]);
     let children: Vec<_> = (0..CHILDREN)
         .map(|_| {
-            let child = spawn_reader(remote, &cache, mode);
+            let child = spawn_reader(remote, &cache, mode, envs);
             std::thread::sleep(stagger);
             child
         })
@@ -286,7 +291,10 @@ fn transient_files(dir: &Path) -> Vec<PathBuf> {
         let name = entry.file_name().to_string_lossy().to_string();
         if path.is_dir() {
             found.extend(transient_files(&path));
-        } else if name.starts_with(".rgstore.tmp.") || name.starts_with(".rgstore.lock") {
+        } else if name.starts_with(".rgstore.tmp.")
+            || name.starts_with(".rgstore.lock")
+            || name.starts_with(".rgstore.fetch.")
+        {
             found.push(path);
         }
     }
@@ -294,15 +302,19 @@ fn transient_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Readers that load whole sequences, all starting on an empty cache: none may
-/// read a partly written file, or lose a file another reader's open deleted.
+/// read a partly written file, or lose a file another reader's open deleted,
+/// and between them they download each sequence once.
 fn processes_loading_whole_sequences_share_a_cold_cache() {
     let work = tempfile::tempdir().unwrap();
     let remote_dir = work.path().join("remote");
     build_remote_store(&remote_dir, work.path());
-    let (remote, _log) = serve(remote_dir);
+    let (remote, log) = serve(remote_dir);
     for round in 0..ROUNDS {
-        let cache = run_round(&remote, work.path(), round, "whole");
+        let before = seq_requests(&log);
+        let cache = run_round(&remote, work.path(), round, "whole", &[]);
         assert_eq!(transient_files(&cache), Vec::<PathBuf>::new());
+        let downloads = seq_requests(&log).0 - before.0;
+        assert_eq!(downloads, SEQUENCES.len(), ".seq downloads in round {round}");
     }
 }
 
@@ -328,8 +340,7 @@ fn cached_seq_files(dir: &Path, root: &Path, found: &mut Vec<PathBuf>) {
 
 /// Readers that only read substrings, with whole-sequence caching on: every
 /// sequence lands in the shared cache, identical to the remote's file, after
-/// whole-file downloads only, and readers that miss together are the only ones
-/// to download it twice.
+/// one whole-file download each.
 fn range_reads_cache_whole_sequences_once_per_cache() {
     let work = tempfile::tempdir().unwrap();
     let remote_dir = work.path().join("remote");
@@ -337,15 +348,12 @@ fn range_reads_cache_whole_sequences_once_per_cache() {
     let (remote, log) = serve(remote_dir.clone());
     for round in 0..STAGGER_MS.len() {
         let before = seq_requests(&log);
-        let cache = run_round(&remote, work.path(), round, "ranges");
+        let cache = run_round(&remote, work.path(), round, "ranges", &[]);
         assert_eq!(transient_files(&cache), Vec::<PathBuf>::new());
         let (whole, ranged) = seq_requests(&log);
         assert_eq!(ranged, before.1, "a byte-range request was made in round {round}");
         let downloads = whole - before.0;
-        assert!(
-            (SEQUENCES.len()..=SEQUENCES.len() * CHILDREN).contains(&downloads),
-            "{downloads} .seq downloads in round {round}"
-        );
+        assert_eq!(downloads, SEQUENCES.len(), ".seq downloads in round {round}");
         let mut cached = Vec::new();
         cached_seq_files(&cache, &cache, &mut cached);
         assert_eq!(cached.len(), SEQUENCES.len());
@@ -368,11 +376,45 @@ fn range_reads_fetch_byte_ranges_by_default() {
     let remote_dir = work.path().join("remote");
     build_remote_store(&remote_dir, work.path());
     let (remote, log) = serve(remote_dir);
-    let cache = run_round(&remote, work.path(), 0, "ranges-remote");
+    let cache = run_round(&remote, work.path(), 0, "ranges-remote", &[]);
     let (whole, ranged) = seq_requests(&log);
     assert_eq!(whole, 0);
     assert!(ranged > 0);
     let mut cached = Vec::new();
     cached_seq_files(&cache, &cache, &mut cached);
     assert_eq!(cached, Vec::<PathBuf>::new());
+}
+
+/// A fetch marker left by a process that died mid-download delays the readers
+/// of that file until it goes stale, then they fetch it themselves, and the
+/// marker is cleaned up.
+fn an_abandoned_fetch_marker_only_delays_readers() {
+    let work = tempfile::tempdir().unwrap();
+    let remote_dir = work.path().join("remote");
+    build_remote_store(&remote_dir, work.path());
+    let (remote, log) = serve(remote_dir.clone());
+
+    let big = &expected()[0].1;
+    let mut remote_seqs = Vec::new();
+    cached_seq_files(&remote_dir, &remote_dir, &mut remote_seqs);
+    let big_seq = remote_seqs
+        .into_iter()
+        .find(|p| p.file_stem().is_some_and(|s| s == big.as_str()))
+        .unwrap();
+    let cache = work.path().join("cache-ranges-0");
+    let marker_dir = cache.join(big_seq.parent().unwrap());
+    std::fs::create_dir_all(&marker_dir).unwrap();
+    let marker = marker_dir.join(format!(".rgstore.fetch.{}", big_seq.file_name().unwrap().to_string_lossy()));
+    std::fs::write(&marker, b"").unwrap();
+
+    let started = std::time::Instant::now();
+    let cache = run_round(&remote, work.path(), 0, "ranges", &[("GTARS_FETCH_STALE_AFTER", "1")]);
+    assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+    assert_eq!(transient_files(&cache), Vec::<PathBuf>::new());
+    assert_eq!(
+        std::fs::read(cache.join(&big_seq)).unwrap(),
+        std::fs::read(remote_dir.join(&big_seq)).unwrap()
+    );
+    let big_downloads = log.lock().unwrap().get(&format!("/{}", big_seq.display())).map(|e| e.0);
+    assert!(big_downloads.is_some_and(|n| (1..=CHILDREN).contains(&n)), "{big_downloads:?}");
 }

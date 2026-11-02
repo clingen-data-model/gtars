@@ -158,11 +158,16 @@ fn sync_dir(dir: &Path) {
     }
 }
 
-/// True if `name` is a transient artifact of the atomic-publish or locking
-/// machinery, and therefore must be ignored by anything enumerating or
-/// mirroring a store directory.
+/// Prefix of a remote store's in-progress fetch marker (see `fetch_marker`),
+/// followed by the name of the file being fetched.
+pub const FETCH_MARKER_PREFIX: &str = ".rgstore.fetch.";
+
+/// True if `name` is a transient artifact of the atomic-publish, locking or
+/// remote-fetch machinery, and therefore must be ignored by anything
+/// enumerating or mirroring a store directory.
 pub fn is_transient_store_file(name: &str) -> bool {
     name.starts_with(".rgstore.tmp.")
+        || name.starts_with(FETCH_MARKER_PREFIX)
         || name == ".rgstore.lock"
         || name == ".rgstore.lock.break"
         || name.starts_with(".rgstore.lock.stale.")
